@@ -1,0 +1,162 @@
+这份文档将褪去所有产品包装，直接下探到 **代码结构、数据库 Schema 设计、API 契约 (Contract) 以及核心算法逻辑**。
+
+作为开发人员，你需要构建的是一个**“基于图谱推理与长效记忆的 RAG (检索增强生成) 智能体系统”**。以下是针对后端研发与 AI 算法工程师的硬核落地指南。
+
+---
+
+### 一、 数据存储层：双库协同设计 (Schema Design)
+
+系统绝对不能依赖大模型自己的“幻觉”出题[cite: 1]。底层数据必须是结构化的。我们需要 **Neo4j（图逻辑）** + **Milvus（向量文本）** 的混合检索。
+
+#### 1. Neo4j (知识图谱) Schema 设计
+这是 Agent 进行“学情诊断”的地图。
+*   **Node 1: `KnowledgePoint` (知识点)**
+    *   `id` (String): 唯一主键，如 `MATH_7_01_03` (七年级上-第一章-第三节)。
+    *   `name` (String): "去括号法则"。
+    *   `level` (Int): 认知层级 (1=了解, 2=理解, 3=掌握, 4=综合应用)。
+    *   `weight` (Float): 默认难度基数。
+*   **Node 2: `Student` (学生)**
+    *   `id` (String): 关联 SpringBoot 业务端的用户 ID。
+*   **Edges (关系):**
+    *   `(:KnowledgePoint)-[:PREREQUISITE_FOR]->(:KnowledgePoint)`: 前置依赖关系。**开发重点**：这是用于“降级溯源”出题的路径。
+    *   `(:Student)-[:MASTERY {score: 0.65, last_tested: "2026-05-05"}]->(:KnowledgePoint)`: 动态掌握度。每次练习后，Agent 必须执行 Cypher 语句更新此 `score`。
+
+#### 2. Milvus (向量数据库) Collection 设计
+存储你自研的权威标准化题目[cite: 1]。
+*   **Collection 字段 (Field):**
+    *   `question_id` (VarChar, Primary Key): 题目唯一 ID。
+    *   `kp_id` (VarChar): **核心！** 该题绑定的主知识点 ID（Scalar 标量字段，必须建索引）。
+    *   `embedding` (FloatVector, dim=1024): 题目文本+解析的 Embedding 向量。
+    *   `difficulty` (Float): 题目难度 (0.0-1.0)。
+*   **开发提示：** Agent 搜题时，**必须先做标量过滤 (Scalar Filtering)**。即 `expr="kp_id == 'MATH_7_01_03'"`，然后再在结果集里做 Vector 相似度检索。这保证了取出的题目 100% 不超纲[cite: 1]。
+
+---
+
+### 二、 核心大脑：LangGraph 智能体状态机实现
+
+这是整个项目的核心代码逻辑。使用 Python 的 `langgraph` 库，不要用脆弱的 LangChain `AgentExecutor`。
+
+#### 1. 定义状态 (State)
+```python
+from typing import TypedDict, List, Dict
+from langgraph.graph import StateGraph
+
+class StudentState(TypedDict):
+    student_id: str
+    session_id: str
+    intent: str # "analyze_error" 或 "generate_paper"
+    input_data: str # OCR识别出的错题文本 或 请求参数
+    identified_kps: List[str] # 本次涉及的知识点ID
+    memory_snapshot: List[Dict] # 从Mem0提取的历史记忆
+    graph_reasoning_path: List[str] # Neo4j推导出的降级/升级路径
+    selected_questions: List[str] # 最终从Milvus抽取的题目ID列表
+```
+
+#### 2. 定义核心节点 (Nodes)
+在你的 FastAPI 服务中，实现以下核心 Python 函数：
+
+*   **Node A: `extract_knowledge_points`**
+    调用 LLM，让大模型分析 `input_data`，输出匹配的 `kp_id`。
+*   **Node B: `query_long_term_memory`**
+    调用 `mem0` 库和 `Neo4j`，查询该 `student_id` 对 `identified_kps` 的掌握度（`MASTERY score`）。
+*   **Node C: `graph_reasoning` (核心算法)**
+    *如果掌握度 < 0.6*：执行 Cypher 查询 `MATCH (prev:KnowledgePoint)-[:PREREQUISITE_FOR]->(curr:KnowledgePoint {id: $kp_id}) RETURN prev.id`。将 `prev.id` 加入出题列表（降级打基础）[cite: 1]。
+*   **Node D: `retrieve_from_milvus`**
+    根据算出的知识点分布和难度，向 Milvus 发起带过滤条件的 RAG 检索。
+
+#### 3. 编译工作流
+```python
+workflow = StateGraph(StudentState)
+workflow.add_node("extract_kps", extract_knowledge_points)
+workflow.add_node("query_memory", query_long_term_memory)
+workflow.add_node("reasoning", graph_reasoning)
+workflow.add_node("retrieve", retrieve_from_milvus)
+
+# 连线
+workflow.set_entry_point("extract_kps")
+workflow.add_edge("extract_kps", "query_memory")
+workflow.add_edge("query_memory", "reasoning")
+workflow.add_edge("reasoning", "retrieve")
+workflow.set_finish_point("retrieve")
+
+# 编译为可执行应用
+educant_agent = workflow.compile()
+```
+
+---
+
+### 三、 深度学情记忆引擎 (Mem0 落地逻辑)
+
+不要简单地记录“做错了第5题”。我们需要**语义化的认知图谱更新**。
+
+**开发流程：**
+1.  Java 后端判卷完成后，发送异步 MQ 消息给 Python 侧。
+2.  Python 侧的记忆守护进程抓取该消息，包含：`题目原文`、`标准解析`、`学生的错误答案/步骤`。
+3.  **LLM 提炼 Prompt (硬核指令)：**
+    > "你是一个阅卷专家。请对比标准解析与学生的错误步骤。不要输出废话，严格输出一句话总结学生的认知盲区。示例：'在处理分式方程去分母时，忘记等式右边的常数项也要乘以公分母'。"
+4.  **写入 Mem0：**
+    ```python
+    from mem0 import Memory
+    m = Memory()
+    m.add(
+        messages=[{"role": "user", "content": "在处理分式方程去分母时，忘记常数项也要乘以公分母"}],
+        user_id="student_889"
+    )
+    ```
+
+---
+
+### 四、 API 契约与微服务交互 (Java <-> Python)
+
+SpringBoot 作为网关和业务控制台，FastAPI 作为 AI 算力引擎。
+
+#### 1. 出卷接口交互 (HTTP RPC)
+**Request (Java -> FastAPI `POST /api/v1/agent/generate-paper`)**
+```json
+{
+  "student_id": "STU_10024",
+  "request_type": "WEEKLY_REVIEW", // 周复习卷
+  "target_chapter": "MATH_7_02",
+  "question_count": 15
+}
+```
+
+**Response (FastAPI -> Java)**
+```json
+{
+  "status": "success",
+  "data": {
+    "paper_title": "七年级数学第2章：基于学情薄弱项的精准复习",
+    "diagnostic_report": "根据系统记忆，您在'移项变号'环节近两周错误率较高，本次已为您增加3道变式巩固题。",
+    "questions": [
+      {"q_id": "Q_7281", "kp_id": "MATH_7_01_03", "type": "基础"},
+      {"q_id": "Q_9921", "kp_id": "MATH_7_01_02", "type": "溯源强化"}
+    ]
+  }
+}
+```
+**Java 端处理**：拿到 `Q_7281` 等 ID 后，去 MySQL 查出题目的图片 URL 或富文本内容，组装后返给前端 Vue3 或直接发给打印机[cite: 1]。
+
+---
+
+### 五、 试卷排版与打印机底层对接 (执行层)
+
+这是实现“出题即打印”闭环的关键[cite: 1]。
+
+#### 1. 试卷排版引擎 (Python)
+强烈建议抛弃复杂的 Word 生成，使用 **HTML + CSS + WeasyPrint/Puppeteer** 生成标准 PDF。
+*   编写一套包含页眉、页脚、装订线、大题号、公式渲染 (MathJax预渲染) 的 HTML/Jinja2 模板。
+*   将题目填入模板，Python 调用 `WeasyPrint` 生成严格控制边距（例如 A4, 上下边距 2.54cm）的 PDF 文件[cite: 1]。
+
+#### 2. 硬件控制层
+*   获取专属打印机的 IoT SDK（通常通过 MQTT 协议进行通信）。
+*   SpringBoot 维护一张设备绑定表 `device_binding (user_id, printer_mac_address)`。
+*   生成 PDF 后，将其上传至 OSS，获取下载 URL。Java 后端通过 MQTT 发送打印指令：`{"cmd": "PRINT_URL", "url": "https://oss.../paper_123.pdf", "copies": 1}`。打印机硬件解析并自动打印[cite: 1]。
+
+### 给主程的落地排期建议：
+作为开发者，你的第一周任务**不是**去调大模型聊天，而是：
+1. 本地起一个 Neo4j Docker，用 Python 写脚本，把 1 个章节的知识点和前置关系塞进去，跑通 `Cypher` 路径查询。
+2. 本地起一个 Milvus Docker，把 100 道题 Embedding 进去，跑通带标量过滤的向量检索。
+
+这两个组件调通了，你的智能体才有真正的“手脚”，否则只是空谈。
+```
